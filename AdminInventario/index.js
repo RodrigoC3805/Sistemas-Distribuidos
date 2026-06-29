@@ -26,6 +26,8 @@ const iniciarModulo = async () => {
       const ordenRecibida = JSON.parse(message.value.toString());
       console.log(`\n📦 Nueva orden detectada en el Bus:`, ordenRecibida);
 
+      // Capturamos el ID secuencial que generó Python en NeonDB
+      const orderId = ordenRecibida.id || 'sin-id';
       const items = ordenRecibida.items || [];
       let ordenAprobada = true;
       let motivoRechazo = '';
@@ -37,7 +39,6 @@ const iniciarModulo = async () => {
       try {
         // Verificar stock de cada item en la orden
         for (const item of items) {
-          // Soporta si mandas 'code' o 'product_id' desde el cliente
           const codigo = item.code || item.product_id; 
           const cantidadSolicitada = item.quantity;
 
@@ -63,7 +64,7 @@ const iniciarModulo = async () => {
             break;
           }
           
-          // OPCIONAL: Si la orden es aprobada, podrías restar el stock aquí con un UPDATE:
+          // OPCIONAL: Descomentar para restar stock real si pasa la validación
           // await pgClient.query('UPDATE inventario SET cantidad_existente = cantidad_existente - $1 WHERE codigo_articulo = $2', [cantidadSolicitada, codigo]);
         }
       } catch (err) {
@@ -74,26 +75,39 @@ const iniciarModulo = async () => {
         await pgClient.end(); // Cerrar conexión de BD de forma segura
       }
 
-      // 3. Notificar el resultado de vuelta al Bus de Kafka
-      const eventoInventario = {
-        order_id: ordenRecibida.id || 'sin-id',
-        status: ordenAprobada ? 'STOCK_VERIFIED' : 'STOCK_REJECTED',
-        motivo: motivoRechazo,
-        timestamp: Date.now(),
-        detalles: items
-      };
-
-      await producer.send({
-        topic: 'inventario-verificado',
-        messages: [
-          { key: eventoInventario.order_id.toString(), value: JSON.stringify(eventoInventario) }
-        ]
-      });
-
+      // 3. Notificar el resultado de vuelta al Bus de Kafka según el veredicto
       if (ordenAprobada) {
+        // 🟩 CAMINO FELIZ: Continúa al Módulo 3 a través de 'inventario-verificado'
+        const eventoInventario = {
+          order_id: orderId,
+          status: 'STOCK_VERIFIED',
+          timestamp: Date.now(),
+          detalles: items
+        };
+
+        await producer.send({
+          topic: 'inventario-verificado',
+          messages: [
+            { key: orderId.toString(), value: JSON.stringify(eventoInventario) }
+          ]
+        });
         console.log(`🟩 ORDEN APROBADA: Mensaje enviado al tópico 'inventario-verificado'`);
+
       } else {
-        console.log(`🟥 ORDEN RECHAZADA: ${motivoRechazo}`);
+        // 🟥 CAMINO DE RECHAZO: Bypass directo al tópico de control 'ordenes-status'
+        const eventoRechazo = {
+          order_id: orderId,
+          status: 'REJECTED',
+          timestamp: Date.now()
+        };
+
+        await producer.send({
+          topic: 'ordenes-status',
+          messages: [
+            { key: orderId.toString(), value: JSON.stringify(eventoRechazo) }
+          ]
+        });
+        console.log(`🟥 ORDEN RECHAZADA: ${motivoRechazo}. Notificado a 'ordenes-status'`);
       }
     },
   });
