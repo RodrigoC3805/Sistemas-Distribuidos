@@ -3,62 +3,63 @@ import threading
 from datetime import datetime
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.pool import ThreadedConnectionPool  # Soportar hilos de FastAPI + Worker de Kafka
 from fastapi import FastAPI, HTTPException
 from app.schemas import OrderRequest
 from confluent_kafka import Producer, Consumer
 
 app = FastAPI(title="Módulo 1: Procesamiento de Órdenes")
 
-DATABASE_URL = 'postgresql://neondb_owner:npg_lwWYMGDA58kE@ep-withered-lab-aimrndoh-pooler.c-4.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require'
+# 🔏 URL OFICIAL CON REGLAS DE RED OPTIMIZADAS PARA PYTHON
+DATABASE_URL = 'postgresql://neondb_owner:npg_Eab4jKD5oJhg@ep-misty-hall-atly3o4p-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=prefer&gssencmode=disable'
 
-# Configuración de Kafka (Apunta a tu IP Wi-Fi local)
+# Inicialización del Pool Seguro para Multihilo (Ajustado para no saturar al pooler de Neon)
+try:
+    db_pool = ThreadedConnectionPool(1, 4, DATABASE_URL, connect_timeout=5)
+    print("✅ ThreadedConnectionPool (Optimizado para Neon Pooler) inicializado con éxito.")
+except Exception as e:
+    print(f"💥 Error fatal al inicializar el Pool de BD: {e}")
+    db_pool = None
+
+# Configuración de Kafka Local (Tu IP Wi-Fi)
 KAFKA_BROKER = '192.168.1.49:9092'
-
 kafka_config = {
     'bootstrap.servers': KAFKA_BROKER,
-    'client.id': 'modulo-procesamiento-ordenes'
+    'client.id': 'modulo-procesamiento-ordenes',
+    'socket.timeout.ms': 3000
 }
-
 producer = Producer(kafka_config)
 
 def delivery_report(err, msg):
     if err is not None:
-        print(f"Error al entregar mensaje: {err}")
+        print(f"❌ Kafka delivery error: {err}")
     else:
-        print(f"Mensaje entregado con éxito a {msg.topic()} [Partición: {msg.partition()}]")
+        print(f"🟩 Mensaje entregado con éxito a {msg.topic()} [Partición: {msg.partition()}]")
 
 # --- ENDPOINTS ---
 
 @app.post("/orders")
 def create_order(order: OrderRequest):
-    # Validaciones existentes
+    print("\n📥 [POST /orders] Petición recibida. Iniciando validaciones...")
+    
+    # Validaciones de negocio
     if not order.items:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "status": "ERROR",
-                "message": "Hubo un error al enviar su orden"
-            }
-        )
-
+        raise HTTPException(status_code=400, detail={"status": "ERROR", "message": "Hubo un error al enviar su orden"})
     for item in order.items:
         if item.quantity <= 0:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "status": "ERROR",
-                    "message": "Hubo un error al enviar su orden"
-                }
-            )
+            raise HTTPException(status_code=422, detail={"status": "ERROR", "message": "Hubo un error al enviar su orden"})
 
-    # 1. Preparar datos para NeonDB
+    print("✅ Validaciones de esquema superadas.")
+
     items_list = [item.dict() for item in order.items]
     items_json = json.dumps(items_list)
     fecha_actual = datetime.now()
 
-    # 2. Persistencia en la tabla 'registro_ordenes' usando el ID Serial de Neon
+    order_id_str = None
+    conn = None
+    print("⏳ POST: Solicitando conexión rápida al Pool...")
     try:
-        conn = psycopg2.connect(DATABASE_URL)
+        conn = db_pool.getconn()  # Toma una conexión caliente del pool de inmediato
         cursor = conn.cursor()
         
         cursor.execute(
@@ -70,22 +71,22 @@ def create_order(order: OrderRequest):
         )
         
         generated_id = cursor.fetchone()[0]
-        order_id_str = str(generated_id)  # ID secuencial definitivo (1, 2, 3...)
+        order_id_str = str(generated_id)
 
         conn.commit()
         cursor.close()
-        conn.close()
-        print(f"💾 Orden #{order_id_str} registrada en NeonDB.")
+        print(f"💾 BD ÉXITO: Orden #{order_id_str} guardada en NeonDB.")
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "status": "ERROR",
-                "message": f"Error de persistencia en la base de datos: {str(e)}"
-            }
-        )
+        if conn:
+            conn.rollback()
+        print(f"💥 ERROR EN POST NEONDB: {str(e)}")
+        raise HTTPException(status_code=500, detail={"status": "ERROR", "message": f"Error de persistencia: {str(e)}"})
+    finally:
+        if conn:
+            db_pool.putconn(conn)  # Devuelve la conexión al pool inmediatamente para liberar el socket
 
-    # 3. Empaquetar la orden con el ID correcto y enviarla a Kafka
+    # 2. Publicar el Evento en Kafka
+    print(f"🛰️ Publicando Orden #{order_id_str} en Kafka...")
     order_data = {
         "id": order_id_str,
         "items": items_list,
@@ -94,45 +95,34 @@ def create_order(order: OrderRequest):
 
     try:
         producer.produce(
-            topic='ordenes-procesadas',
-            key=order_id_str,
-            value=json.dumps(order_data).encode('utf-8'),
+            topic='ordenes-procesadas', 
+            key=order_id_str, 
+            value=json.dumps(order_data).encode('utf-8'), 
             callback=delivery_report
         )
         producer.flush(timeout=1.0)
-
+        print("📨 Evento enviado al buffer de Kafka.")
     except Exception as e:
-        # Si falla Kafka, se podría manejar un rollback, pero aquí se reporta el error de bus
-        print(f"Error detectado en el bus: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "status": "ERROR",
-                "message": f"No se pudo registrar en el bus de mensajes: {str(e)}"
-            }
-        )
+        print(f"💥 ERROR KAFKA: {e}")
+        raise HTTPException(status_code=500, detail={"status": "ERROR", "message": f"Error en bus: {str(e)}"})
 
-    # Retorno exitoso enviando de vuelta el ID secuencial real generado
     return {
-        "status": "RECEIVED",
-        "order_id": order_id_str,
+        "status": "RECEIVED", 
+        "order_id": order_id_str, 
         "message": "Su orden ha sido enviada"
     }
 
 
 @app.get("/orders")
 def get_orders():
-    """Endpoint para enviar la lista de órdenes completa e histórica a la app móvil"""
+    conn = None
     try:
-        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
-        cursor = conn.cursor()
-        
+        conn = db_pool.getconn()
+        cursor = conn.cursor(cursor_factory=RealDictCursor)
         cursor.execute("SELECT id, items, estado, fecha_registro, num_factura, fecha_entrega FROM registro_ordenes ORDER BY id ASC")
         rows = cursor.fetchall()
-        
         cursor.close()
-        conn.close()
-
+        
         resultado = []
         for row in rows:
             resultado.append({
@@ -144,65 +134,67 @@ def get_orders():
                 "fecha_entrega": row['fecha_entrega']
             })
         return resultado
-
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "status": "ERROR",
-                "message": f"No se pudo obtener la lista de órdenes: {str(e)}"
-            }
-        )
+        raise HTTPException(status_code=500, detail={"status": "ERROR", "message": str(e)})
+    finally:
+        if conn:
+            db_pool.putconn(conn)
 
-# --- WORKER CONSUMIDOR EN SEGUNDO PLANO (HILO APARTE) ---
+
+# --- WORKER CONSUMIDOR ASÍNCRONO ---
 def kafka_consumer_worker():
     consumer_config = {
         'bootstrap.servers': KAFKA_BROKER,
         'group.id': 'grupo-procesamiento-ordenes-status',
-        'auto.offset.reset': 'latest'
+        'auto.offset.reset': 'latest',
+        'socket.timeout.ms': 3000
     }
-    consumer = Consumer(consumer_config)
-    # Escucha el nuevo tópico correcto de control unificado
-    consumer.subscribe(['ordenes-status']) 
-
-    print("🎧 Worker de Python activo y escuchando cambios en 'ordenes-status'...")
+    
+    try:
+        consumer = Consumer(consumer_config)
+        consumer.subscribe(['ordenes-status']) 
+        print("🎧 Worker de Python activo y escuchando 'ordenes-status'...")
+    except Exception as e:
+        print(f"💥 Error al iniciar el consumidor de Kafka: {e}")
+        return
     
     while True:
         msg = consumer.poll(1.0)
-        if msg is None or msg.error():
+        if msg is None:
+            continue
+        if msg.error():
+            print(f"⚠️ Alerta Worker Kafka: {msg.error()}")
             continue
 
         try:
             evento = json.loads(msg.value().decode('utf-8'))
             order_id = int(evento.get("order_id"))
             status = evento.get("status")
+            
+            print(f"📥 Worker capturó actualización para Orden #{order_id} [{status}]")
 
-            conn = psycopg2.connect(DATABASE_URL)
+            # El worker solicita de forma segura su propia conexión aislada al pool
+            conn = db_pool.getconn()
             cursor = conn.cursor()
 
             if status == "REJECTED":
-                # Si llega de Node.js, cambia a 'RECHAZADA' sin guardar motivo
-                cursor.execute(
-                    "UPDATE registro_ordenes SET estado = 'RECHAZADA' WHERE id = %s",
-                    (order_id,)
-                )
-                print(f"❌ Orden #{order_id} actualizada a RECHAZADA en NeonDB.")
-            
+                cursor.execute("UPDATE registro_ordenes SET estado = 'RECHAZADA' WHERE id = %s", (order_id,))
+                print(f"🔄 BD Actualizada por Worker: Orden #{order_id} -> RECHAZADA.")
             elif status == "COMPLETED":
-                # Si llega del módulo final, actualiza con los campos de la factura
                 num_factura = evento.get("num_factura")
                 fecha_entrega = evento.get("fecha_entrega")
                 cursor.execute(
                     "UPDATE registro_ordenes SET estado = 'COMPLETADA', num_factura = %s, fecha_entrega = %s WHERE id = %s",
                     (num_factura, fecha_entrega, order_id)
                 )
-                print(f"🎉 Orden #{order_id} actualizada a COMPLETADA en NeonDB.")
+                print(f"🔄 BD Actualizada por Worker: Orden #{order_id} -> COMPLETADA.")
 
             conn.commit()
             cursor.close()
-            conn.close()
-        except Exception as e:
-            print(f"⚠️ Error en el Worker asíncrono de actualización: {e}")
+            db_pool.putconn(conn)  # Liberar la conexión asíncrona de inmediato
 
-# Iniciar la escucha asíncrona de Kafka en background al encender FastAPI
+        except Exception as e:
+            print(f"⚠️ Error interno en Worker asíncrono: {e}")
+
+# Arrancar el hilo en background de forma limpia
 threading.Thread(target=kafka_consumer_worker, daemon=True).start()
