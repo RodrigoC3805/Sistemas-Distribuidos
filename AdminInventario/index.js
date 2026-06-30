@@ -7,7 +7,7 @@ const DATABASE_URL = 'postgresql://neondb_owner:npg_Eab4jKD5oJhg@ep-misty-hall-a
 // 2. Conexión al Bus de Kafka Local (Tu IP Wi-Fi)
 const kafka = new Kafka({
   clientId: 'modulo-inventario',
-  brokers: ['192.168.1.49:9092'] 
+  brokers: ['20.186.91.190:9092'] 
 });
 
 const consumer = kafka.consumer({ groupId: 'grupo-inventario' });

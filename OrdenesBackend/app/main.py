@@ -21,12 +21,12 @@ except Exception as e:
     print(f"💥 Error fatal al inicializar el Pool de BD: {e}")
     db_pool = None
 
-# Configuración de Kafka Local (Tu IP Wi-Fi)
-KAFKA_BROKER = '192.168.1.49:9092'
+KAFKA_BROKER = '20.186.91.190:9092'  
+
 kafka_config = {
     'bootstrap.servers': KAFKA_BROKER,
     'client.id': 'modulo-procesamiento-ordenes',
-    'socket.timeout.ms': 3000
+    'socket.timeout.ms': 5000
 }
 producer = Producer(kafka_config)
 
@@ -119,7 +119,7 @@ def get_orders():
     try:
         conn = db_pool.getconn()
         cursor = conn.cursor(cursor_factory=RealDictCursor)
-        cursor.execute("SELECT id, items, estado, fecha_registro, num_factura, fecha_entrega FROM registro_ordenes ORDER BY id ASC")
+        cursor.execute("SELECT id, items, estado, fecha_registro, num_factura, fecha_entrega FROM registro_ordenes ORDER BY fecha_registro DESC")
         rows = cursor.fetchall()
         cursor.close()
         
