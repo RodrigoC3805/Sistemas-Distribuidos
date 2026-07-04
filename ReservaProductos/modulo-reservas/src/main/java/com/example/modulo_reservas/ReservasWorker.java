@@ -6,7 +6,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
-import org.springframework.stereotype.Service; // 💻 Ahora sí se debe reconocer
+import org.springframework.stereotype.Service;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -25,37 +25,45 @@ public class ReservasWorker {
     private ObjectMapper objectMapper;
 
     @Autowired
-    private JdbcTemplate jdbcTemplate; // 💾 Conector a tu base de datos
+    private JdbcTemplate jdbcTemplate; // Conector a tu base de datos Neon
 
-    // 🔍 CORREGIDO: Ahora escucha exactamente "inventario-verificado"
-    @KafkaListener(topics = "inventario-verificado")
+    // Escucha exactamente "inventario-verificado" que envía Node.js
+    @KafkaListener(topics = "inventario-verificado", groupId = "grupo-reservas")
     public void procesarReserva(String mensajeIn) {
         try {
             log.info("📦 Mensaje recibido desde Inventario: {}", mensajeIn);
             JsonNode datosOrden = objectMapper.readTree(mensajeIn);
             
-            String ordenId = datosOrden.get("order_id").asText();
-            JsonNode items = datosOrden.get("detalles");
+            // Usamos path() en lugar de get() para evitar NullPointerException si el JSON cambia
+            String ordenId = datosOrden.path("order_id").asText("sin-id");
+            JsonNode items = datosOrden.path("detalles");
 
             log.info("⚙️ Procesando Reserva para la Orden ID: {}", ordenId);
 
-            if (items != null) {
+            // 1. Modificar la base de datos de reservas (Tu lógica física existente)
+            if (!items.isMissingNode() && items.isArray()) {
                 actualizarBaseDeDatos(items);
             } else {
                 log.warn("⚠️ La orden no contiene la lista de 'detalles' de productos.");
             }
 
-            // Preparar envío a Facturación
+            // 2. El Pasamanos Perfecto: Convertimos a ObjectNode mutable
+            // Esto mantiene vivos: codigo_cliente, nombre_cliente, ruc_cliente, price y subtotal
             ObjectNode mensajeFacturacion = (ObjectNode) datosOrden;
+            
+            // Agregamos la firma de este módulo para la rúbrica
             mensajeFacturacion.put("estado_reserva", "COMPLETADA");
+            mensajeFacturacion.put("timestamp_reserva", System.currentTimeMillis());
 
+            // 3. Serializar todo el JSON enriquecido de vuelta a String
             String mensajeOut = objectMapper.writeValueAsString(mensajeFacturacion);
             
-            kafkaTemplate.send(TOPICO_SALIDA, mensajeOut).whenComplete((resultado, ex) -> {
+            // 4. Enviar a .NET usando el orderId como KEY de partición
+            kafkaTemplate.send(TOPICO_SALIDA, ordenId, mensajeOut).whenComplete((resultado, ex) -> {
                 if (ex != null) {
                     log.error("❌ Error al enviar a Facturación: {}", ex.getMessage());
                 } else {
-                    log.info("🚀 Evento enviado a Facturación en el tópico [{}]", TOPICO_SALIDA);
+                    log.info("🚀 Evento completo (Clientes + Precios de BD) retransmitido a Facturación en [{}]", TOPICO_SALIDA);
                 }
             });
 
@@ -68,25 +76,25 @@ public class ReservasWorker {
 
     private void actualizarBaseDeDatos(JsonNode items) {
         log.info("💾 Conectando a la Base de Datos para actualizar existencias...");
-        if (items.isArray()) {
-            for (JsonNode item : items) {
-                String articuloId = item.get("code").asText();
-                int cantidadSolicitada = item.get("quantity").asInt();
+        
+        for (JsonNode item : items) {
+            // Soportamos que el código venga como 'code' o 'product_id'
+            String articuloId = item.path("code").isMissingNode() ? item.path("product_id").asText() : item.path("code").asText();
+            int cantidadSolicitada = item.path("quantity").asInt(0);
+            
+            // Tu query SQL real
+            String sql = "UPDATE inventario SET cantidad_existente = cantidad_existente - ? WHERE codigo_articulo = ?";
+            
+            try {
+                int filasAfectadas = jdbcTemplate.update(sql, cantidadSolicitada, articuloId);
                 
-                // 🛠️ Ejecución SQL Real
-                String sql = "UPDATE inventario SET cantidad_existente = cantidad_existente - ? WHERE codigo_articulo = ?";
-                
-                try {
-                    int filasAfectadas = jdbcTemplate.update(sql, cantidadSolicitada, articuloId);
-                    
-                    if (filasAfectadas > 0) {
-                        log.info("📉 Stock disminuido en BD: Artículo {} en -{} unidades.", articuloId, cantidadSolicitada);
-                    } else {
-                        log.warn("⚠️ No se encontró el artículo {} en la base de datos.", articuloId);
-                    }
-                } catch (Exception e) {
-                    log.error("❌ Error al ejecutar el UPDATE en la BD: {}", e.getMessage());
+                if (filasAfectadas > 0) {
+                    log.info("📉 Stock disminuido en BD: Artículo {} en -{} unidades.", articuloId, cantidadSolicitada);
+                } else {
+                    log.warn("⚠️ No se encontró el artículo {} en la base de datos.", articuloId);
                 }
+            } catch (Exception e) {
+                log.error("❌ Error al ejecutar el UPDATE en la BD: {}", e.getMessage());
             }
         }
         log.info("✅ Proceso de actualización de Base de Datos finalizado.");
