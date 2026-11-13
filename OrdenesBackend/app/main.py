@@ -10,9 +10,9 @@ from confluent_kafka import Producer, Consumer
 
 app = FastAPI(title="Módulo 1: Procesamiento de Órdenes")
 
-# 🔏 URL OFICIAL CON REGLAS DE RED OPTIMIZADAS PARA PYTHON
-DATABASE_URL = 'postgresql://neondb_owner:npg_Eab4jKD5oJhg@ep-misty-hall-atly3o4p-pooler.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=prefer&gssencmode=disable'
-
+# La URL de la BD se pasa por variable de entorno (archivo .env en la VM)
+import os
+DATABASE_URL = os.environ["DATABASE_URL"]
 # Inicialización del Pool Seguro para Multihilo (Ajustado para no saturar al pooler de Neon)
 try:
     db_pool = ThreadedConnectionPool(1, 4, DATABASE_URL, connect_timeout=5)
@@ -21,7 +21,7 @@ except Exception as e:
     print(f"💥 Error fatal al inicializar el Pool de BD: {e}")
     db_pool = None
 
-KAFKA_BROKER = '20.186.91.190:9092'  
+KAFKA_BROKER = os.getenv("KAFKA_BROKER", "kafka:19092")  
 
 kafka_config = {
     'bootstrap.servers': KAFKA_BROKER,
